@@ -4,12 +4,14 @@ Make a **Xerox Phaser 3020** print over **USB** from a modern **Apple Silicon Ma
 even though Xerox never shipped a driver for Apple Silicon or for macOS newer than
 Monterey (12).
 
-> **Verified:** macOS 26.x (Apple Silicon, arm64), printer on USB. No virtual machine,
-> no Linux, no network/AirPrint required.
+> **Verified:** USB printing on an **M5 MacBook Air running macOS 27.0.1**, confirmed
+> by the user after applying the updated launchers. The PDF → raster → SPL pipeline
+> also passes locally. The original setup was verified over USB on macOS 26.x.
 
-**Compatibility:** any Apple Silicon Mac — **M1, M2, M3, M4** — on a modern macOS that still
-has **Rosetta 2** and **CUPS** (tested on macOS 26 *Tahoe*; the same steps apply to *Sonoma*
-14 / *Sequoia* 15 and should hold on later releases). Also works on **Intel Macs**, where the
+**Compatibility:** any Apple Silicon Mac — **M1, M2, M3, M4, M5** — on a modern macOS that still
+has **Rosetta 2** and **CUPS PPD/filter support** (including macOS 27 *Golden Gate*).
+Apple documents general Rosetta support through macOS 27; do not assume this Intel driver
+will work on macOS 28. See [Apple’s Rosetta guidance](https://support.apple.com/en-us/102527). Also works on **Intel Macs**, where the
 filter runs natively without Rosetta. Because the 3020 is a rebadged **Samsung** engine, this
 approach is a useful template for other host-based Samsung/Xerox **SPL** printers too (e.g.
 Samsung **M2020 / M2022 / M2070**, Xerox **Phaser 3052 / 3260**).
@@ -53,8 +55,10 @@ PDF→raster pipeline (`cgpdftoraster`) are built in. The *only* missing piece i
 encoder. And that missing piece already exists: it's Xerox/Samsung's own **`rastertosec`**
 filter — an **x86_64 Mach-O** executable.
 
-Apple Silicon Macs can run x86_64 binaries through **Rosetta 2**. A CUPS filter is just a
-program that reads on stdin and writes on stdout; CUPS doesn't care what architecture it is.
+Apple Silicon Macs can run x86_64 binaries through **Rosetta 2**. A CUPS filter is a
+program that reads on stdin and writes on stdout. On the macOS 27.0.1 setup checked here,
+CUPS rejected the bundled universal Intel/i386 executables with `Bad CPU type in executable`,
+while explicitly selecting x86_64 worked.
 So:
 
 > **We run the vendor's own SPL rasterizer under Rosetta 2.**
@@ -96,16 +100,19 @@ The vendor PPD (`driver/Xerox_Phaser_3020.ppd`) wires the filter in by **absolut
 
 So the install simply:
 
-1. Copies the filters to `/Library/Printers/Xerox/P3020/` (exactly where the PPD points).
+1. Copies the original filters as `*.bin` to `/Library/Printers/Xerox/P3020/` and installs
+   shell launchers at the original PPD paths. Each runs `/usr/bin/arch -x86_64 "$0.bin" "$@"`.
    - `rastertosec`   — raster → SPL (the core filter)
    - `prefilter`     — vendor pre-processing helper
    - `commandtosec`  — maintenance commands (clean/align)
    - `SCMS/`         — screening/halftone tables the filter loads at runtime
-2. Drops the PPD into the system PPD repository.
+2. Generates an installation PPD without references to unbundled legacy GUI plugins,
+   utilities, and icons, then places it in the system PPD repository. The vendor original
+   and its checksum stay unchanged.
 3. Creates a CUPS queue bound to the printer's `usb://…` device URI.
 
-Because the filter binaries are `x86_64`, macOS transparently runs them under Rosetta 2 when
-CUPS invokes them. Nothing else is required.
+The explicit architecture selection lets macOS run the Intel filters under Rosetta when
+CUPS invokes the launchers. Intel Macs use the same launchers without translation.
 
 ### How this was figured out (transferable method)
 
@@ -158,32 +165,57 @@ removed from macOS and you'd need to supply it.
 
 It checks your Mac, installs Rosetta 2 if needed, auto-detects the printer's USB URI
 (so it works regardless of the unit's serial number), installs the driver, and creates the
-queue. Re-runnable (idempotent) — it replaces an existing queue cleanly.
+queue. Re-runnable — it updates an existing queue in place without deleting queued jobs.
+It tests Intel execution and filter loading rather than checking Rosetta folders/processes.
+If several Phaser 3020 units are connected, it asks you to rerun with `URI` set to one of
+the listed device URIs. `QUEUE` can override the default queue name.
 
 ### Manual (if the script ever breaks on a future macOS)
 
 ```bash
 DEST=/Library/Printers/Xerox/P3020
-sudo mkdir -p "$DEST/SCMS"
-sudo cp driver/rastertosec driver/prefilter driver/commandtosec "$DEST/"
-sudo cp driver/SCMS/* "$DEST/SCMS/"
-sudo chmod -R 755 "$DEST"
-sudo xattr -dr com.apple.quarantine "$DEST"          # clear "downloaded" flag
+sudo install -d -m 755 "$DEST/SCMS"
+for filter in rastertosec prefilter commandtosec; do
+  sudo install -m 755 "driver/$filter" "$DEST/$filter.bin"
+  sudo install -m 755 scripts/filter-launcher.sh "$DEST/$filter"
+done
+sudo install -m 755 driver/SCMS/libscmssc.dylib "$DEST/SCMS/"
+sudo install -m 644 driver/SCMS/P3020sc.cts "$DEST/SCMS/"
+sudo xattr -dr com.apple.quarantine "$DEST"
 
-# PPD into the system repository (optional, helps the GUI "Add Printer")
-sudo cp "driver/Xerox_Phaser_3020.ppd" \
-        "/Library/Printers/PPDs/Contents/Resources/Xerox Phaser 3020"
+# Generate the PPD without references to absent vendor GUI components.
+./scripts/prepare-ppd.sh > /tmp/Xerox_Phaser_3020.ppd
+sudo install -d -m 755 /Library/Printers/PPDs/Contents/Resources
+sudo install -m 644 /tmp/Xerox_Phaser_3020.ppd \
+  "/Library/Printers/PPDs/Contents/Resources/Xerox Phaser 3020"
 
-# find the device URI, then create the queue
-URI=$(lpinfo -v | awk '/usb:.*([Pp]haser|3020)/{print $2; exit}')
-sudo lpadmin -p Xerox_Phaser_3020 -E -v "$URI" -P driver/Xerox_Phaser_3020.ppd \
-     -D "Xerox Phaser 3020 (SPL via Rosetta 2)" -L USB
-sudo cupsenable Xerox_Phaser_3020 && sudo cupsaccept Xerox_Phaser_3020
+# Copy your printer's exact USB URI from this list:
+lpinfo -v
+URI='usb://Xerox/Phaser%203020?serial=YOUR_SERIAL'
+sudo lpadmin -p Xerox_Phaser_3020 -E -v "$URI" -P /tmp/Xerox_Phaser_3020.ppd \
+  -D "Xerox Phaser 3020 (SPL via Rosetta 2)" -L USB
+sudo cupsenable Xerox_Phaser_3020
+sudo cupsaccept Xerox_Phaser_3020
 ```
 
 ---
 
 ## Testing
+
+Read-only installation and connection checks:
+
+```bash
+./bootstrap.sh --check
+```
+
+Exercise the real macOS PDF → raster → SPL pipeline in a temporary directory, with no
+installation, administrator password, or print job:
+
+```bash
+./test/check-pipeline.sh
+```
+
+Send a physical test page after installation:
 
 ```bash
 ./scripts/wake-and-print.sh
@@ -211,9 +243,14 @@ Clear a stuck job with `cancel -a Xerox_Phaser_3020`.
 
 **Plug it straight into the Mac**, not through a hub, while getting it working.
 
+**`Bad CPU type in executable` / `com.apple.badarch-error`:** rerun `./bootstrap.sh`
+to install the explicit x86_64 launchers. A successful `arch -x86_64` test of the raw
+binary alone does not prove CUPS can launch it directly. `./bootstrap.sh --check` checks
+that the launcher is installed too.
+
 **Nothing prints but no error:** check the filter still loads under Rosetta:
 ```bash
-arch -x86_64 /Library/Printers/Xerox/P3020/rastertosec </dev/null   # should print a usage line
+/Library/Printers/Xerox/P3020/rastertosec </dev/null   # should print a usage line
 ```
 and watch the log: `log show --predicate 'process == "cupsd"' --last 2m` or
 `tail -f /var/log/cups/error_log` (needs sudo).
@@ -225,11 +262,12 @@ copied files by hand, run `sudo xattr -dr com.apple.quarantine /Library/Printers
 
 ## Longevity & alternatives
 
-This relies on two things Apple/CUPS could remove someday. If they do:
+This relies on Intel translation and CUPS PPD/filter support:
 
-- **If Rosetta 2 is removed** (Apple Silicon): the Intel filter won't run. Fall back to the
-  open-source **[SpliX](https://github.com/OpenPrinting/splix)** / **foo2zjs** SPL drivers
-  (build native arm64), or to AirPrint below.
+- **macOS 28 and later:** Apple says general Rosetta support ends after macOS 27
+  ([source](https://support.apple.com/en-us/102527)). This Intel filter is not a supported
+  solution for that release. Native SPL drivers or a separate compatible print server
+  would need model-specific testing; this repo does not supply either.
 - **If CUPS drops PPD/filter drivers** (CUPS has deprecated them): use the printer's
   **AirPrint over Wi-Fi** instead — put the 3020 on your network and macOS drives it with
   **zero drivers**, future-proof across OS upgrades. (Note: the 3020's AirPrint is Wi-Fi
@@ -278,10 +316,14 @@ Removes the queue, the filters under `/Library/Printers/Xerox/P3020`, and the in
 │   ├── Xerox_Phaser_3020.ppd
 │   └── SOURCE.md             # provenance, attribution, checksums, download link
 ├── scripts/
+│   ├── doctor.sh             # read-only installation/USB checks
+│   ├── filter-launcher.sh    # select the Intel 64-bit slice explicitly
+│   ├── prepare-ppd.sh        # omit absent legacy GUI components
 │   ├── uninstall.sh
 │   ├── wake-and-print.sh     # detect/wake printer, print the test page
 │   └── extract-driver.sh     # rebuild driver/ from a vendor DMG
 ├── test/
+│   ├── check-pipeline.sh     # render to SPL without installation or printing
 │   ├── test-page.pdf
 │   └── test-page.ps
 ├── LICENSE                   # MIT — covers the scripts/docs ONLY, not driver/
